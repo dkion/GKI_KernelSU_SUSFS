@@ -889,34 +889,36 @@ jobs:
         run: |
           set -euo pipefail
         
-          NOMOUNT_SRC="$GITHUB_WORKSPACE/kernel_patches/nomount"
-          PATCH_FILE="$NOMOUNT_SRC/nomount_kernel_integration.patch"
+          NOMOUNT_BASE="https://raw.githubusercontent.com/Bouteillepleine/NoMount-Suite/main/hookless"
+          PATCH_URL="$NOMOUNT_BASE/patches/nomount_kernel_integration.patch"
+          SRC_URL="$NOMOUNT_BASE/src/nomount.c"
+          HDR_URL="$NOMOUNT_BASE/src/nomount.h"
         
-          for f in "$PATCH_FILE" "$NOMOUNT_SRC/nomount.c" "$NOMOUNT_SRC/nomount.h"; do
-            if [ ! -f "$f" ]; then
-              echo "::error::NoMount 源文件缺失: $f"
-              exit 1
-          fi
+          echo "下载 NoMount 补丁与源码（来源: NoMount-Suite/hookless）..."
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
+            "$PATCH_URL" -o /tmp/nomount_kernel_integration.patch
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
+            "$SRC_URL" -o /tmp/nomount.c
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
+            "$HDR_URL" -o /tmp/nomount.h
+        
+          # 非空 + 关键内容校验，避免下载到错误页面
+          for f in /tmp/nomount_kernel_integration.patch /tmp/nomount.c /tmp/nomount.h; do
+            [ -s "$f" ] || { echo "::error::NoMount 文件下载失败或为空: $f"; exit 1; }
           done
+          grep -q 'config NOMOUNT' /tmp/nomount_kernel_integration.patch \
+            || { echo "::error::补丁内容异常（缺少 config NOMOUNT）"; exit 1; }
+          grep -q 'NM_MODULE_VERSION' /tmp/nomount.h \
+            || { echo "::error::nomount.h 内容异常（缺少 NM_MODULE_VERSION）"; exit 1; }
         
-          # 补丁从内核源码根（common/）应用，-p1 去掉 a/ b/ 前缀
-          # --forward 让重复运行不报错；--fuzz=3 容忍上下文偏移
-          if ! patch -p1 --fuzz=3 --forward < "$PATCH_FILE"; then
-            echo "::error::NoMount 集成补丁应用失败，请检查 .rej 并调整补丁锚点"
+          # 补丁从 common/ 根应用
+          if ! patch -p1 --fuzz=3 --forward < /tmp/nomount_kernel_integration.patch; then
+            echo "::error::NoMount 集成补丁应用失败，请检查 .rej"
             exit 1
           fi
         
-          # 放置引擎源码（补丁的 fs/Makefile 期望 fs/nomount.c + fs/nomount.h）
-          cp -f "$NOMOUNT_SRC/nomount.c" fs/
-          cp -f "$NOMOUNT_SRC/nomount.h" fs/
-        
-          # 验证四个 hunk 都落地
-          test -f fs/nomount.c
-          test -f fs/nomount.h
-          grep -q 'obj-$(CONFIG_NOMOUNT) += nomount.o' fs/Makefile
-          grep -q 'config NOMOUNT' fs/Kconfig
-          grep -q 'vfs_map_meta_override' fs/proc/task_mmu.c
-          grep -q 'nm_inode_hidden_from_caller' fs/xattr.c
+          cp -f /tmp/nomount.c fs/
+          cp -f /tmp/nomount.h fs/
         
           # 启用 CONFIG_NOMOUNT（幂等）
           if ! grep -q '^CONFIG_NOMOUNT=y' "$DEFCONFIG"; then
@@ -926,7 +928,7 @@ jobs:
             echo "CONFIG_NOMOUNT=y 已存在，跳过"
           fi
         
-          echo "NoMount 集成完成（本地源，未使用 setup.sh）"
+          echo "NoMount 集成完成（来源: NoMount-Suite/hookless）"
 
       - name: 集成 Droidspaces 支持
         if: inputs.droidspaces != 'off'
