@@ -971,6 +971,22 @@ jobs:
                 exit 1
               fi
         
+              # 放在 cp -f "$NOMOUNT_SRC/nomount.c" fs/ 之前
+              perl -0pi -e '
+                s{^extern int ghost_ctl\(const char \*buf, size_t count\) __attribute__\(\(weak\)\);$}
+                 {__attribute__((weak)) int ghost_ctl(const char *buf, size_t count) { return -EINVAL; }}m;
+                s{^extern int ghost_get_rule\(int idx, char \*out, size_t outsz\) __attribute__\(\(weak\)\);$}
+                 {__attribute__((weak)) int ghost_get_rule(int idx, char *out, size_t outsz) { return 0; }}m;
+                s{^extern int pathhide_ctl\(const char \*buf, size_t count\) __attribute__\(\(weak\)\);$}
+                 {__attribute__((weak)) int pathhide_ctl(const char *buf, size_t count) { return -EINVAL; }}m;
+                s{^extern int pathhide_get_rule\(int idx, char \*out, size_t outsz\) __attribute__\(\(weak\)\);$}
+                 {__attribute__((weak)) int pathhide_get_rule(int idx, char *out, size_t outsz) { return 0; }}m;
+              ' "$NOMOUNT_SRC/nomount.c"
+                
+              # 自检：必须输出 4
+              STUB_COUNT=$(grep -c '__attribute__((weak)) int' "$NOMOUNT_SRC/nomount.c")
+              echo "弱定义桩数量: $STUB_COUNT"
+              [ "$STUB_COUNT" -eq 4 ] || { echo "::error::nomount.c 弱符号替换失败，上游文件结构可能已变"; exit 1; }
               # 放置引擎源码（补丁的 fs/Makefile 期望 fs/nomount.c + fs/nomount.h）
               cp -f "$NOMOUNT_SRC/nomount.c" fs/
               cp -f "$NOMOUNT_SRC/nomount.h" fs/
