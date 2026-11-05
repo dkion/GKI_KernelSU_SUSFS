@@ -963,12 +963,7 @@ jobs:
                   exit 1
                 fi
               done
-
-              # 放在 cp -f "$NOMOUNT_SRC/nomount.c" fs/ 之前
-              sed -i 's/__attribute__((weak));/__attribute__((weak, visibility("hidden")));/' \
-                "$NOMOUNT_SRC/nomount.c"
-              grep -c 'visibility("hidden")' "$NOMOUNT_SRC/nomount.c"   # 应输出 4 
-                   
+        
               # 补丁从内核源码根（common/）应用，-p1 去掉 a/ b/ 前缀
               # --forward 让重复运行不报错；--fuzz=3 容忍上下文偏移
               if ! patch -p1 --fuzz=3 --forward < "$PATCH_FILE"; then
@@ -1658,6 +1653,7 @@ jobs:
               sed -i '/KMI_SYMBOL_LIST_STRICT_MODE/d' ./common/build.config.gki.aarch64
 
               if [ -f "build/build.sh" ]; then
+                LDFLAGS_vmlinux="-z norelro" \
                 LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh CC="/usr/bin/ccache clang" || exit 1
                 strings "out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist/Image" | grep 'Linux version'
               else
