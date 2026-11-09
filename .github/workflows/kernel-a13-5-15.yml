@@ -266,7 +266,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.prepare-matrix.outputs.matrix) }}
-    uses: ./.github/workflows/build-G.yml
+    uses: ./.github/workflows/build-G2.yml
     secrets: inherit
     with:
       android_version: "android13"
