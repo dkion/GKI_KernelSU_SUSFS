@@ -73,7 +73,7 @@ on:
         description: "自定义构建时间 (可选，N或留空=当前UTC)"
         required: false
         type: string
-        default: "Mon Jul 7 16:28:30 UTC 2025"
+        default: "Mon Jul 07 16:28:30 UTC 2025"
 
       # ==================== 开关（默认关闭） ====================
       use_zram:
@@ -122,7 +122,7 @@ on:
       build_time:
         required: false
         type: string
-        default: "Mon Jul 7 16:28:30 UTC 2025"
+        default: "Mon Jul 07 16:28:30 UTC 2025"
       use_zram:
         required: true
         type: boolean
