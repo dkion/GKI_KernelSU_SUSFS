@@ -306,48 +306,128 @@ jobs:
           git clone $AOSP_MIRROR/platform/system/tools/mkbootimg -b $BRANCH --depth 1 mkbootimg
 
       # ★ 下载自定义编译器（Neutron / ZyC / GCC；AOSP 官方走 repo 内 prebuilts，无需下载）
+      # 下载失败时回退到 AOSP 官方 clang 而不是让构建报废
       - name: 下载自定义编译器
         if: inputs.compiler != 'clang-aosp (Google官方)' && inputs.compiler != ''
         env:
           COMPILER: ${{ inputs.compiler }}
           CLANG_VERSION: ${{ inputs.clang_version }}
+          GH_PROXY_LIST: "" # 可填镜像前缀，空格分隔，如 "https://ghproxy.net/ https://gh-proxy.com/"
         run: |
-          set -euo pipefail
+          set -uo pipefail
+
+          # ---------- 通用健壮下载函数 ----------
+          # 指数退避重试 + 多镜像轮询 + -C - 断点续传
+          robust_download() {
+            local url="$1" output="$2"
+            local attempt max_attempts=5 delay
+            local -a candidates=("$url")
+            # 附加镜像前缀候选
+            for proxy in $GH_PROXY_LIST; do
+              candidates+=("${proxy}${url}")
+            done
+
+            rm -f "$output"
+            for attempt in $(seq 1 $max_attempts); do
+              for candidate in "${candidates[@]}"; do
+                echo "下载（第 $attempt/$max_attempts 次）: $candidate"
+                # -C - 续传残缺文件；--retry 处理传输层错误；-f 保证 4xx/5xx 视为失败
+                if curl -fL --retry 3 --retry-delay 5 --retry-all-errors \
+                     --connect-timeout 30 --max-time 1800 \
+                     -C - "$candidate" -o "$output"; then
+                  # 校验文件完整性：tar 包至少应为合法压缩档头部
+                  if [ -s "$output" ] && file "$output" | grep -qiE 'zst|gzip|xz|zip|tar'; then
+                    echo "下载成功: $(du -h "$output" | cut -f1)"
+                    return 0
+                  fi
+                  echo "::warning::下载内容异常（非压缩档），删除重试"
+                  rm -f "$output"
+                else
+                  echo "::warning::下载失败（退出码 $?），尝试下一个候选源"
+                  # 504/502 等网关错误时删掉残缺文件，续传无意义
+                  rm -f "$output"
+                fi
+              done
+              delay=$((10 * attempt))
+              echo "${delay}s 后重试..."
+              sleep "$delay"
+            done
+            return 1
+          }
+
+          latest_tag() {
+            local attempt
+            for attempt in 1 2 3; do
+              local tag
+              tag=$(curl -s --connect-timeout 30 --retry 3 --retry-delay 5 --retry-all-errors \
+                "https://api.github.com/repos/$1/releases/latest" | jq -r .tag_name 2>/dev/null)
+              if [ -n "$tag" ] && [ "$tag" != "null" ]; then
+                echo "$tag"
+                return 0
+              fi
+              sleep 5
+            done
+            return 1
+          }
+
+          fallback_to_aosp() {
+            echo "::warning title=编译器下载失败::${COMPILER} 下载失败（GitHub Release CDN 返回错误），已回退到 AOSP 官方 Clang 继续构建"
+            echo "COMPILER_FALLBACK=true" >> "$GITHUB_ENV"
+            exit 0
+          }
+
           TOOLCHAIN_DIR="$HOME/toolchain"
           rm -rf "$TOOLCHAIN_DIR"
           mkdir -p "$TOOLCHAIN_DIR"
-          latest_tag() {
-            curl -s --retry 5 --retry-delay 3 "https://api.github.com/repos/$1/releases/latest" | jq -r .tag_name
-          }
 
           case "$COMPILER" in
             "clang-neutron (Neutron优化版)")
-              VER=${CLANG_VERSION:-$(latest_tag Neutron-Toolchains/clang-build-catalogue)}
-              URL=$(curl -s --retry 5 "https://api.github.com/repos/Neutron-Toolchains/clang-build-catalogue/releases/tags/$VER" \
+              VER=${CLANG_VERSION:-$(latest_tag Neutron-Toolchains/clang-build-catalogue)} \
+                || fallback_to_aosp
+              URL=$(curl -s --retry 3 --retry-delay 5 --retry-all-errors \
+                "https://api.github.com/repos/Neutron-Toolchains/clang-build-catalogue/releases/tags/$VER" \
                 | jq -r '.assets[] | select(.name | endswith(".tar.zst")) | .browser_download_url' | head -n1)
-              [ -n "$URL" ] || { echo "::error::未找到 Neutron Clang $VER 的下载地址" >&2; exit 1; }
+              [ -n "$URL" ] && [ "$URL" != "null" ] || { echo "::error::未找到 Neutron Clang $VER 的下载地址"; fallback_to_aosp; }
               echo "下载 Neutron Clang $VER ..."
-              curl -fL --retry 5 --retry-delay 3 --retry-all-errors "$URL" -o /tmp/clang.tar.zst
-              tar --zstd -xf /tmp/clang.tar.zst -C "$TOOLCHAIN_DIR"
+              if robust_download "$URL" /tmp/clang.tar.zst; then
+                tar --zstd -xf /tmp/clang.tar.zst -C "$TOOLCHAIN_DIR" || fallback_to_aosp
+              else
+                fallback_to_aosp
+              fi
               ;;
             "clang-zyc (ZyCromerZ)")
-              VER=${CLANG_VERSION:-$(latest_tag ZyCromerZ/Clang)}
-              URL=$(curl -s --retry 5 "https://api.github.com/repos/ZyCromerZ/Clang/releases/tags/$VER" \
-                | jq -r '.assets[] | select(.name | endswith(".tar.gz") or endswith(".tar.xz") or endswith(".tar.zst")) | .browser_download_url' | head -n1)
-              [ -n "$URL" ] || { echo "::error::未找到 ZyC Clang $VER 的下载地址" >&2; exit 1; }
+              VER=${CLANG_VERSION:-$(latest_tag ZyCromerZ/Clang)} \
+                || fallback_to_aosp
+              URL=$(curl -s --retry 3 --retry-delay 5 --retry-all-errors \
+                "https://api.github.com/repos/ZyCromerZ/Clang/releases/tags/$VER" \
+                | jq -r '.assets[] | select(.name | test("\\.tar\\.(gz|xz|zst)$")) | .browser_download_url' | head -n1)
+              [ -n "$URL" ] && [ "$URL" != "null" ] || { echo "::error::未找到 ZyC Clang $VER 的下载地址"; fallback_to_aosp; }
               echo "下载 ZyC Clang $VER ..."
-              curl -fL --retry 5 --retry-delay 3 --retry-all-errors "$URL" -o /tmp/clang-pkg
-              case "$URL" in
-                *.tar.gz)  tar -xzf /tmp/clang-pkg -C "$TOOLCHAIN_DIR" ;;
-                *.tar.xz)  tar -xJf /tmp/clang-pkg -C "$TOOLCHAIN_DIR" ;;
-                *.tar.zst) tar --zstd -xf /tmp/clang-pkg -C "$TOOLCHAIN_DIR" ;;
-              esac
+              if robust_download "$URL" /tmp/clang-pkg; then
+                case "$URL" in
+                  *.tar.gz)  tar -xzf /tmp/clang-pkg -C "$TOOLCHAIN_DIR" || fallback_to_aosp ;;
+                  *.tar.xz)  tar -xJf /tmp/clang-pkg -C "$TOOLCHAIN_DIR" || fallback_to_aosp ;;
+                  *.tar.zst) tar --zstd -xf /tmp/clang-pkg -C "$TOOLCHAIN_DIR" || fallback_to_aosp ;;
+                esac
+              else
+                fallback_to_aosp
+              fi
               ;;
             "gcc (GCC工具链)")
               echo "克隆 GCC 工具链..."
-              git clone --depth=1 \
+              if ! git clone --depth=1 \
                 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-8.3 \
-                "$TOOLCHAIN_DIR/gcc"
+                "$TOOLCHAIN_DIR/gcc"; then
+                # GCC 无等价回退方案（clang 语义不同），重试 3 次后直接报错
+                for attempt in 2 3; do
+                  echo "GCC 克隆重试（第 $attempt/3 次）..."
+                  sleep $((15 * attempt))
+                  git clone --depth=1 \
+                    https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-8.3 \
+                    "$TOOLCHAIN_DIR/gcc" && break
+                  [ "$attempt" = "3" ] && { echo "::error::GCC 工具链克隆连续失败"; exit 1; }
+                done
+              fi
               [ -x "$TOOLCHAIN_DIR/gcc/bin/aarch64-linux-android-gcc" ] \
                 || { echo "::error::GCC 工具链不完整" >&2; exit 1; }
               "$TOOLCHAIN_DIR/gcc/bin/aarch64-linux-android-gcc" --version | head -n1
@@ -364,10 +444,12 @@ jobs:
           if [ -x "$TOOLCHAIN_DIR/bin/clang" ]; then
             CLANG_BIN="$TOOLCHAIN_DIR/bin"
           else
-            CLANG_BIN=$(find "$TOOLCHAIN_DIR" -maxdepth 4 -type f -name clang -path '*/bin/*' | head -n1 | xargs dirname || true)
+            CLANG_BIN=$(find "$TOOLCHAIN_DIR" -maxdepth 4 -type f -name clang -path '*/bin/*' | head -n1 | xargs dirname 2>/dev/null || true)
           fi
-          [ -n "$CLANG_BIN" ] && [ -x "$CLANG_BIN/clang" ] \
-            || { echo "::error::未找到 clang 二进制" >&2; exit 1; }
+          if [ -z "$CLANG_BIN" ] || [ ! -x "$CLANG_BIN/clang" ]; then
+            echo "::error::解压后未找到 clang 二进制"
+            fallback_to_aosp
+          fi
 
           "$CLANG_BIN/clang" --version | head -n1
           echo "CLANG_BIN=$CLANG_BIN" >> "$GITHUB_ENV"
