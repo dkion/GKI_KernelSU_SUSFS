@@ -131,7 +131,7 @@ jobs:
           echo "子版本号      : ${{ inputs.sub_level }}"
           echo "补丁级别      : ${{ inputs.os_patch_level }}"
           echo "KSU 变体      : ${{ inputs.ksu_variant }}"
-          echo "编译器        : ${{ inputs.compiler }}" # ★
+          echo "编译器        : ${{ inputs.compiler }}"
           echo "构建时间      : ${{ inputs.build_time }}"
           echo "SUSFS 状态    : ${{ inputs.enable_susfs }}"
           echo "ZRAM 增强     : ${{ inputs.use_zram }}"
@@ -259,7 +259,7 @@ jobs:
       - name: 安装编译依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y ccache python3 git curl build-essential libssl-dev bison flex libelf-dev dwarves zstd
+          sudo apt-get install -y ccache python3 git curl build-essential libssl-dev bison flex libelf-dev dwarves zstd file
 
       - name: 配置 ccache
         run: |
@@ -316,8 +316,10 @@ jobs:
         run: |
           set -uo pipefail
 
+          echo "::notice::本次使用编译器: $COMPILER${CLANG_VERSION:+ (版本: $CLANG_VERSION)}"
+
           # ---------- 通用健壮下载函数 ----------
-          # 指数退避重试 + 多镜像轮询 + -C - 断点续传
+          # 指数退避重试 + 多镜像轮询 + 完整性校验
           robust_download() {
             local url="$1" output="$2"
             local attempt max_attempts=5 delay
@@ -331,10 +333,10 @@ jobs:
             for attempt in $(seq 1 $max_attempts); do
               for candidate in "${candidates[@]}"; do
                 echo "下载（第 $attempt/$max_attempts 次）: $candidate"
-                # -C - 续传残缺文件；--retry 处理传输层错误；-f 保证 4xx/5xx 视为失败
+                # --retry 处理传输层错误；-f 保证 4xx/5xx（含 504）视为失败
                 if curl -fL --retry 3 --retry-delay 5 --retry-all-errors \
                      --connect-timeout 30 --max-time 1800 \
-                     -C - "$candidate" -o "$output"; then
+                     "$candidate" -o "$output"; then
                   # 校验文件完整性：tar 包至少应为合法压缩档头部
                   if [ -s "$output" ] && file "$output" | grep -qiE 'zst|gzip|xz|zip|tar'; then
                     echo "下载成功: $(du -h "$output" | cut -f1)"
@@ -344,7 +346,7 @@ jobs:
                   rm -f "$output"
                 else
                   echo "::warning::下载失败（退出码 $?），尝试下一个候选源"
-                  # 504/502 等网关错误时删掉残缺文件，续传无意义
+                  # 504/502 等网关错误产生的残缺文件，续传无意义，直接删除
                   rm -f "$output"
                 fi
               done
@@ -451,7 +453,18 @@ jobs:
             fallback_to_aosp
           fi
 
+          # ★ 方案 A 关键检查：自定义工具链 bin 目录必须自带完整 llvm 工具集
+          # （clang/lld/ld.lld/llvm-ar/llvm-strip/llvm-nm 等），否则链接阶段会混用
+          # prebuilts 的老版本 lld，触发 "Opaque pointers" 错误
+          for required_tool in lld ld.lld llvm-ar llvm-strip llvm-nm; do
+            if [ ! -e "$CLANG_BIN/$required_tool" ]; then
+              echo "::error::自定义工具链缺少 $required_tool，无法整体替换 prebuilts 工具链"
+              fallback_to_aosp
+            fi
+          done
+
           "$CLANG_BIN/clang" --version | head -n1
+          "$CLANG_BIN/ld.lld" --version | head -n1
           echo "CLANG_BIN=$CLANG_BIN" >> "$GITHUB_ENV"
 
       - name: 生成签名密钥
@@ -589,7 +602,7 @@ jobs:
 
             # 最后一次重试前彻底清空：只删 .repo 会残留半检出的 project 目录，
             # 之后每次 sync 都会以 "Checking out local projects failed" 收场。
-            if [ "$attempt" -eq $((MAX_ATTEMPTS - 1)); then
+            if [ "$attempt" -eq $((MAX_ATTEMPTS - 1)) ]; then
               echo "清空工作目录后重来"
               find "$PWD" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
             fi
@@ -1732,10 +1745,40 @@ jobs:
               set -ex
               cd "$KERNEL_ROOT"
 
-              # ★ ---------- 编译器路由 ----------
-              # Neutron/ZyC 自定义 Clang
+              # ★ ========== 编译器路由（方案 A：整体替换 prebuilts LLVM 工具链） ==========
+              # 下载失败回退时 CLANG_BIN 为空，自动走 AOSP 官方 clang
+              if [ "${COMPILER_FALLBACK:-}" = "true" ]; then
+                echo "::warning::本次构建因编译器下载失败已回退到 AOSP 官方 Clang"
+              fi
+
               if [ -n "${CLANG_BIN:-}" ]; then
-                CUSTOM_CC="/usr/bin/ccache $CLANG_BIN/clang"
+                # 定位 prebuilts 的 clang 版本目录（优先读 build.config.constants）
+                CLANG_DIR_NAME=$(sed -n 's/^CLANG_VERSION=//p' common/build.config.constants 2>/dev/null || true)
+                if [ -z "$CLANG_DIR_NAME" ]; then
+                  CLANG_DIR_NAME=$(ls -d prebuilts/clang/host/linux-x86/clang-* 2>/dev/null | xargs -n1 basename 2>/dev/null | head -n1 || true)
+                fi
+
+                if [ -n "$CLANG_DIR_NAME" ] && [ -d "prebuilts/clang/host/linux-x86/$CLANG_DIR_NAME/bin" ]; then
+                  PREBUILT_BIN="prebuilts/clang/host/linux-x86/$CLANG_DIR_NAME/bin"
+                  echo "用 $CLANG_BIN 整体替换 $PREBUILT_BIN（含 clang/lld/llvm-* 全套工具，避免 Producer/Reader 版本不一致）"
+                  # 备份原目录后整体替换：编译器与链接器必须同版本，
+                  # 只换 clang 会造成新版位码被旧版 ld.lld 读取（Opaque pointers 报错）
+                  if [ ! -d "${PREBUILT_BIN}.bak" ]; then
+                    mv "$PREBUILT_BIN" "${PREBUILT_BIN}.bak"
+                  fi
+                  cp -r "$CLANG_BIN" "$PREBUILT_BIN"
+
+                  # build.sh 路径会把 prebuilts bin 前置到 PATH，替换后 PATH 里的
+                  # clang/lld 均已是新版，此处再显式前置一次双保险
+                  export PATH="$PREBUILT_BIN:$PATH"
+                  CUSTOM_CC="/usr/bin/ccache $PREBUILT_BIN/clang"
+                  "$PREBUILT_BIN/clang" --version | head -n1
+                  "$PREBUILT_BIN/ld.lld" --version | head -n1
+                else
+                  echo "::warning::未找到 prebuilts clang 目录，回退为 CC 透传模式（注意：链接器仍是官方版本）"
+                  export PATH="$CLANG_BIN:$PATH"
+                  CUSTOM_CC="/usr/bin/ccache $CLANG_BIN/clang"
+                fi
               # GCC（仅 5.10/5.15 的 build.sh 构建支持）
               elif [ -n "${GCC_PATH:-}" ]; then
                 export PATH="$GCC_PATH:$PATH"
@@ -1745,23 +1788,7 @@ jobs:
                 CUSTOM_CC="/usr/bin/ccache clang"
               fi
 
-              # ★ bazel (6.1+) 构建无 CC 透传入口，
-              # 用自定义 clang 替换 prebuilts 中的对应版本目录
-              if [ ! -f "build/build.sh" ] && [ -n "${CLANG_BIN:-}" ]; then
-                CLANG_DIR_NAME=$(sed -n 's/^CLANG_VERSION=//p' common/build.config.constants 2>/dev/null || true)
-                [ -z "$CLANG_DIR_NAME" ] && CLANG_DIR_NAME=$(ls -d prebuilts/clang/host/linux-x86/clang-* 2>/dev/null | xargs -n1 basename 2>/dev/null | head -n1 || true)
-                if [ -n "$CLANG_DIR_NAME" ] && [ -d "prebuilts/clang/host/linux-x86/$CLANG_DIR_NAME/bin" ]; then
-                  PREBUILT_BIN="prebuilts/clang/host/linux-x86/$CLANG_DIR_NAME/bin"
-                  echo "用 $CLANG_BIN 整体替换 $PREBUILT_BIN"
-                  # ★ 备份原目录，把自定义 clang 的整个 bin（含 lld/llvm-* 全套工具）拷入
-                  mv "$PREBUILT_BIN" "${PREBUILT_BIN}.bak"
-                  cp -r "$CLANG_BIN" "$PREBUILT_BIN"
-                else
-                  echo "::warning::未找到 prebuilts clang 目录，bazel 构建将使用官方 clang"
-                fi
-              fi
-
-              # ★ GCC 不支持 bazel 构建（GKI 6.x 强依赖 LLVM 全工具链）
+              # GCC 不支持 bazel 构建（GKI 6.x 强依赖 LLVM 全工具链）
               if [ ! -f "build/build.sh" ] && [ -n "${GCC_PATH:-}" ]; then
                 echo "::error::GCC 工具链不支持 bazel (6.1+) 构建，请改用 clang 系列" >&2
                 exit 1
@@ -1820,7 +1847,7 @@ jobs:
             echo "内核版本: ${{ inputs.kernel_version }}.${{ inputs.sub_level }}"
             echo "安全补丁级别: ${{ inputs.os_patch_level }}"
             echo "KernelSU 变体: ${{ inputs.ksu_variant }}"
-            echo "编译器: ${{ inputs.compiler }}" # ★
+            echo "编译器: ${{ inputs.compiler }}"
             echo "配置名称: ${CONFIG:-未知}"
             echo "Git 提交: $GITHUB_SHA"
             echo "工作流地址: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
@@ -1844,27 +1871,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
           compression-level: 9
-
-      # - name: 应用 KPM 补丁 (SukiSU/BakaSU/Next)
-      #   if: startsWith(inputs.use_kpm, 'patched') && (inputs.ksu_variant == 'SukiSU' || inputs.ksu_variant == 'BakaSU' || inputs.ksu_variant == 'Next')
-      #   run: |
-      #     case "${{ inputs.android_version }}" in
-      #       "android12"|"android13")
-      #         if [ "${{ inputs.kernel_version }}" != "6.6" ]; then
-      #           TARGET_PATH="$KERNEL_ROOT/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist"
-      #         fi
-      #         ;;
-      #       "android14"|"android15"|"android16")
-      #         TARGET_PATH="$KERNEL_ROOT/bazel-bin/common/kernel_aarch64/"
-      #         ;;
-      #     esac
-
-      #     cp -r $SUKISU_PATCHES/kpm/patch_linux "$TARGET_PATH/patch"
-      #     cd "$TARGET_PATH"
-      #     chmod 777 patch
-      #     ./patch
-      #     rm -rf Image
-      #     mv oImage Image
 
       - name: 准备 Boot 镜像
         run: |
