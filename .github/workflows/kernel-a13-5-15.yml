@@ -14,12 +14,12 @@ on:
         type: choice
         options:
           - Official
-          #- Next
+          - Next
           - SukiSU
           - SukiSU(40726)
           - SukiSU(40548)
           - BakaSU
-        default: BakaSU
+        default: Next
       ksu_mode:
         description: "KernelSU / SUSFS 模式"
         required: true
