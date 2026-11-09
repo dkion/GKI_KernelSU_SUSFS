@@ -62,7 +62,7 @@ on:
         description: "选择 sub_level（逗号分隔，如 74,119,194；留空或 all=全部）"
         required: false
         type: string
-        default: "all"
+        default: "194"
 
       # ==================== 文本输入 ====================
       version:
@@ -73,14 +73,14 @@ on:
         description: "自定义构建时间 (可选，N或留空=当前UTC)"
         required: false
         type: string
-        default: "Sun Dec 01 08:10:00 UTC 2024"
+        default: "Mon Jul 7 16:28:30 UTC 2025"
 
       # ==================== 开关（默认关闭） ====================
       use_zram:
         description: "启用 ZRAM 增强算法"
         required: true
         type: boolean
-        default: false
+        default: true
       use_bbg:
         description: "启用 BBG 防格机"
         required: true
@@ -90,17 +90,17 @@ on:
         description: "启用 Re-Kernel 驱动"
         required: false
         type: boolean
-        default: false
+        default: true
       use_nomount:
         description: "启用 NoMount 挂载元模块"
         required: false
         type: boolean
-        default: false
+        default: true
       use_networking:
         description: "启用网络增强（BBRv3 / IPSet / Qdisc / CIFS）"
         required: false
         type: boolean
-        default: false
+        default: true
       cve_2026_43499_patch:
         description: "应用 CVE-2026-43499 rtmutex 修复链"
         required: false
@@ -122,7 +122,7 @@ on:
       build_time:
         required: false
         type: string
-        default: "Sun Dec 01 08:10:00 UTC 2024"
+        default: "Mon Jul 7 16:28:30 UTC 2025"
       use_zram:
         required: true
         type: boolean
@@ -178,7 +178,7 @@ on:
         description: "选择 sub_level（逗号分隔，留空或 all=全部）"
         required: false
         type: string
-        default: "all"
+        default: "194"
 
 jobs:
   # ============ 动态生成构建矩阵 ============
